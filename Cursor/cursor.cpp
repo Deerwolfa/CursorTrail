@@ -1,12 +1,4 @@
 // Cursor Trail - Win32 + GDI+ (single file, no resource file needed)
-//
-// Visual Studio setup:
-//   1. Create a new "Windows Desktop Application" (or "Empty Project") in C++.
-//   2. Add this file as main.cpp (remove any auto-generated main/WinMain file).
-//   3. Project Properties -> General -> Character Set: "Use Unicode Character Set".
-//   4. Project Properties -> Linker -> System -> SubSystem: Windows (/SUBSYSTEM:WINDOWS).
-//   5. Build & run (x64 or x86, Debug or Release - Release is much faster).
-//
 // The control window holds the menu bar. A transparent, click-through overlay
 // window covers all monitors and draws the trail on top of everything.
 // The control window's title bar shows live frame-time stats.
