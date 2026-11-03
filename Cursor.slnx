@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Cursor/Cursor.vcxproj" Id="ceba0dfa-12cb-4ab2-9282-fef57096f41c" />
+</Solution>
