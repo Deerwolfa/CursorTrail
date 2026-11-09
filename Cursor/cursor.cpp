@@ -1,4 +1,12 @@
 // Cursor Trail - Win32 + GDI+ (single file, no resource file needed)
+//
+// Visual Studio setup:
+//   1. Create a new "Windows Desktop Application" (or "Empty Project") in C++.
+//   2. Add this file as main.cpp (remove any auto-generated main/WinMain file).
+//   3. Project Properties -> General -> Character Set: "Use Unicode Character Set".
+//   4. Project Properties -> Linker -> System -> SubSystem: Windows (/SUBSYSTEM:WINDOWS).
+//   5. Build & run (x64 or x86, Debug or Release - Release is much faster).
+//
 // The control window holds the menu bar. A transparent, click-through overlay
 // window covers all monitors and draws the trail on top of everything.
 // The control window's title bar shows live frame-time stats.
@@ -36,17 +44,19 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <string>
+#include <shlobj.h>
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "shell32.lib")
 
 using namespace Gdiplus;
 
 #define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
-
 
 // ------------------------------------------------------------------ settings
 enum Mode { MODE_SOLID = 0, MODE_GRADIENT = 1, MODE_RAINBOW = 2 };
@@ -94,12 +104,27 @@ enum {
     ID_ENABLED, ID_TAPER, ID_GLOW,
     ID_SHAPE_OUTLINE, ID_SHAPE_FILLED, ID_SHAPE_LINE, ID_SHAPE_HEAT,
     ID_MODE_SOLID, ID_MODE_GRADIENT, ID_MODE_RAINBOW,
+    ID_SAVE_PRESET = 120,
     ID_NCOLORS_BASE = 150,   // + (n - 2), n = 2..10
     ID_EDITCOLOR_BASE = 170,   // + index 0..9
     ID_PRESET_BASE = 200,   // + index
     ID_WIDTH_BASE = 300,   // + index
-    ID_LEN_BASE = 400    // + index
+    ID_LEN_BASE = 400,   // + index
+    ID_USERPRESET_BASE = 500,  // + index (max MAX_USER_PRESETS)
+    ID_DELPRESET_BASE = 600   // + index
 };
+
+// ------------------------------------------------------------------ user presets (saved to an .ini file)
+struct UserPreset {
+    std::wstring name;
+    Mode         mode;
+    int          count;
+    COLORREF     colors[MAX_COLORS];
+};
+static std::vector<UserPreset> g_user;
+static const int MAX_USER_PRESETS = 50;
+static std::wstring g_iniPath;
+static HMENU g_presetsMenu;
 
 // ------------------------------------------------------------------ cursor shape cache
 static const int   LEVELS = 8;      // pre-scaled sizes (taper)
@@ -924,6 +949,279 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProc(h, m, w, l);
 }
 
+// ------------------------------------------------------------------ settings / preset file
+static void InitIniPath() {
+    wchar_t dir[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, dir))) {
+        g_iniPath = std::wstring(dir) + L"\\CursorTrail";
+        CreateDirectoryW(g_iniPath.c_str(), NULL);       // fine if it already exists
+        g_iniPath += L"\\presets.ini";
+    }
+    else {                                              // fallback: next to the .exe
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(NULL, exe, MAX_PATH);
+        wchar_t* slash = wcsrchr(exe, L'\\');
+        if (slash) *slash = 0;
+        g_iniPath = std::wstring(exe) + L"\\presets.ini";
+    }
+}
+
+static int ClampI(int v, int lo, int hi) { return MinI(MaxI(v, lo), hi); }
+
+static COLORREF ReadColor(const wchar_t* sec, const wchar_t* key, COLORREF def) {
+    wchar_t buf[32];
+    GetPrivateProfileStringW(sec, key, L"", buf, 32, g_iniPath.c_str());
+    if (!buf[0]) return def;
+    return (COLORREF)(wcstoul(buf, NULL, 16) & 0xFFFFFF);   // accepts "0x..." too
+}
+static void WriteInt(const wchar_t* sec, const wchar_t* key, int v) {
+    WritePrivateProfileStringW(sec, key, std::to_wstring(v).c_str(), g_iniPath.c_str());
+}
+static void WriteColor(const wchar_t* sec, const wchar_t* key, COLORREF c) {
+    wchar_t buf[16];
+    swprintf_s(buf, L"0x%06X", (unsigned)c);
+    WritePrivateProfileStringW(sec, key, buf, g_iniPath.c_str());
+}
+
+static void SavePresets() {
+    // wipe the old preset sections (a NULL key deletes the whole section)
+    wchar_t names[8192];
+    GetPrivateProfileSectionNamesW(names, 8192, g_iniPath.c_str());
+    for (wchar_t* p = names; *p; p += wcslen(p) + 1)
+        if (wcsncmp(p, L"Preset:", 7) == 0)
+            WritePrivateProfileStringW(p, NULL, NULL, g_iniPath.c_str());
+
+    for (const UserPreset& u : g_user) {
+        std::wstring sec = L"Preset:" + u.name;
+        WriteInt(sec.c_str(), L"mode", (int)u.mode);
+        WriteInt(sec.c_str(), L"count", u.count);
+        for (int i = 0; i < u.count; ++i) {
+            wchar_t key[16]; swprintf_s(key, L"color%d", i);
+            WriteColor(sec.c_str(), key, u.colors[i]);
+        }
+    }
+}
+
+static void LoadPresets() {
+    g_user.clear();
+    wchar_t names[8192];
+    GetPrivateProfileSectionNamesW(names, 8192, g_iniPath.c_str());
+    for (wchar_t* p = names; *p && (int)g_user.size() < MAX_USER_PRESETS; p += wcslen(p) + 1) {
+        if (wcsncmp(p, L"Preset:", 7) != 0 || !p[7]) continue;
+        UserPreset u;
+        u.name = p + 7;
+        u.mode = (Mode)ClampI((int)GetPrivateProfileIntW(p, L"mode", 1, g_iniPath.c_str()), 0, 2);
+        u.count = ClampI((int)GetPrivateProfileIntW(p, L"count", 2, g_iniPath.c_str()), 2, MAX_COLORS);
+        for (int i = 0; i < MAX_COLORS; ++i) {
+            wchar_t key[16]; swprintf_s(key, L"color%d", i);
+            u.colors[i] = ReadColor(p, key, RGB(255, 255, 255));
+        }
+        g_user.push_back(u);
+    }
+}
+
+static void SaveSettings() {
+    const wchar_t* S = L"Settings";
+    WriteInt(S, L"shape", (int)g_set.shape);   WriteInt(S, L"mode", (int)g_set.mode);
+    WriteInt(S, L"count", g_set.count);        WriteInt(S, L"glow", g_set.glow);
+    WriteInt(S, L"taper", g_set.taper);        WriteInt(S, L"width", g_set.width);
+    WriteInt(S, L"lifeMs", g_set.lifeMs);
+    for (int i = 0; i < MAX_COLORS; ++i) {
+        wchar_t key[16]; swprintf_s(key, L"color%d", i);
+        WriteColor(S, key, g_set.colors[i]);
+    }
+}
+
+static void LoadSettings() {
+    const wchar_t* S = L"Settings";
+    auto ri = [&](const wchar_t* k, int def) { return (int)GetPrivateProfileIntW(S, k, def, g_iniPath.c_str()); };
+    g_set.shape = (Shape)ClampI(ri(L"shape", (int)g_set.shape), 0, 3);
+    g_set.mode = (Mode)ClampI(ri(L"mode", (int)g_set.mode), 0, 2);
+    g_set.count = ClampI(ri(L"count", g_set.count), 2, MAX_COLORS);
+    g_set.glow = ri(L"glow", g_set.glow ? 1 : 0) != 0;
+    g_set.taper = ri(L"taper", g_set.taper ? 1 : 0) != 0;
+    g_set.width = ClampI(ri(L"width", g_set.width), 1, 60);
+    g_set.lifeMs = ClampI(ri(L"lifeMs", g_set.lifeMs), 100, 5000);
+    for (int i = 0; i < MAX_COLORS; ++i) {
+        wchar_t key[16]; swprintf_s(key, L"color%d", i);
+        g_set.colors[i] = ReadColor(S, key, g_set.colors[i]);
+    }
+}
+
+// ------------------------------------------------------------------ presets menu
+static std::wstring MenuLabel(const std::wstring& s) {         // '&' means "underline the next letter" in menus
+    std::wstring o;
+    for (wchar_t c : s) { o += c; if (c == L'&') o += L'&'; }  // a doubled && shows as one &
+    return o;
+}
+
+static void RebuildPresetsMenu() {
+    // DeleteMenu also destroys the old Delete submenu, so nothing leaks
+    while (GetMenuItemCount(g_presetsMenu) > 0) DeleteMenu(g_presetsMenu, 0, MF_BYPOSITION);
+
+    for (int i = 0; i < COUNT(kPresets); ++i)
+        AppendMenuW(g_presetsMenu, MF_STRING, ID_PRESET_BASE + i, kPresets[i].name);
+
+    if (!g_user.empty()) {
+        AppendMenuW(g_presetsMenu, MF_SEPARATOR, 0, NULL);
+        for (size_t i = 0; i < g_user.size(); ++i)
+            AppendMenuW(g_presetsMenu, MF_STRING, ID_USERPRESET_BASE + (UINT)i, MenuLabel(g_user[i].name).c_str());
+    }
+    AppendMenuW(g_presetsMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(g_presetsMenu, MF_STRING, ID_SAVE_PRESET, L"&Save current as preset...");
+
+    HMENU del = CreatePopupMenu();
+    for (size_t i = 0; i < g_user.size(); ++i)
+        AppendMenuW(del, MF_STRING, ID_DELPRESET_BASE + (UINT)i, MenuLabel(g_user[i].name).c_str());
+    AppendMenuW(g_presetsMenu, MF_POPUP | (g_user.empty() ? MF_GRAYED : 0), (UINT_PTR)del, L"&Delete preset");
+
+    if (g_main) DrawMenuBar(g_main);   // g_main doesn't exist yet on the first call
+}
+
+// ------------------------------------------------------------------ "Save preset" name dialog (built in memory, no .rc file)
+enum { IDC_NAME = 101 };                    // ID of the text box (OK=1 and Cancel=2 are predefined)
+
+struct NameDlgData { wchar_t name[64]; };   // holds the suggested name in, the typed name out
+
+static void Put(std::vector<WORD>& v, WORD w) { v.push_back(w); }
+static void PutDword(std::vector<WORD>& v, DWORD d) { v.push_back(LOWORD(d)); v.push_back(HIWORD(d)); }
+static void PutStr(std::vector<WORD>& v, const wchar_t* s) {
+    do { v.push_back((WORD)*s); } while (*s++);   // copies the characters AND the terminating 0
+}
+
+static void AddItem(std::vector<WORD>& v, WORD atom, DWORD style,
+    short x, short y, short cx, short cy, WORD id, const wchar_t* text) {
+    if (v.size() % 2) v.push_back(0);                    // each control must start on a 4-byte boundary
+    PutDword(v, style | WS_CHILD | WS_VISIBLE);          // style
+    PutDword(v, 0);                                      // extended style
+    Put(v, (WORD)x); Put(v, (WORD)y);                    // position, in dialog units
+    Put(v, (WORD)cx); Put(v, (WORD)cy);                  // size, in dialog units
+    Put(v, id);                                          // control ID
+    Put(v, 0xFFFF); Put(v, atom);                        // built-in class: 0x80 button, 0x81 edit, 0x82 static
+    PutStr(v, text);                                     // initial text
+    Put(v, 0);                                           // no extra creation data
+}
+
+static INT_PTR CALLBACK NameDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_INITDIALOG: {
+        SetWindowLongPtrW(h, DWLP_USER, l);                       // stash our data pointer on the dialog
+        NameDlgData* d = (NameDlgData*)l;
+        SetDlgItemTextW(h, IDC_NAME, d->name);                    // show the suggested name
+        SendDlgItemMessageW(h, IDC_NAME, EM_SETLIMITTEXT, 40, 0); // names up to 40 characters
+        SendDlgItemMessageW(h, IDC_NAME, EM_SETSEL, 0, -1);       // select it so typing replaces it
+        SetFocus(GetDlgItem(h, IDC_NAME));
+        return FALSE;                                             // FALSE = we already set the focus
+    }
+    case WM_COMMAND:
+        if (LOWORD(w) == IDOK) {                                  // OK button, or Enter
+            NameDlgData* d = (NameDlgData*)GetWindowLongPtrW(h, DWLP_USER);
+            GetDlgItemTextW(h, IDC_NAME, d->name, 64);            // copy the text back out
+            EndDialog(h, IDOK);
+            return TRUE;
+        }
+        if (LOWORD(w) == IDCANCEL) {                              // Cancel button, Esc, or the X
+            EndDialog(h, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;                                                 // let the dialog manager do the rest
+}
+
+static bool AskPresetName(HWND owner, std::wstring& name) {
+    std::vector<WORD> t;
+
+    // --- dialog header ---
+    PutDword(t, (DWORD)(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU));
+    PutDword(t, 0);                    // extended style
+    Put(t, 4);                         // number of controls
+    Put(t, 0); Put(t, 0);              // x, y (ignored because of DS_CENTER)
+    Put(t, 180); Put(t, 70);           // width, height
+    Put(t, 0);                         // no menu
+    Put(t, 0);                         // default dialog window class
+    PutStr(t, L"Save preset");         // title bar text
+    Put(t, 9);                         // font size (required by DS_SETFONT)
+    PutStr(t, L"Segoe UI");            // font name
+
+    // --- controls ---
+    AddItem(t, 0x0082, SS_LEFT, 8, 8, 164, 10, (WORD)-1, L"Preset name:");
+    AddItem(t, 0x0081, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 8, 20, 164, 12, IDC_NAME, L"");
+    AddItem(t, 0x0080, WS_TABSTOP | BS_DEFPUSHBUTTON, 64, 46, 50, 14, IDOK, L"OK");
+    AddItem(t, 0x0080, WS_TABSTOP | BS_PUSHBUTTON, 120, 46, 50, 14, IDCANCEL, L"Cancel");
+
+    // --- show it ---
+    NameDlgData d = {};
+    wcsncpy_s(d.name, name.c_str(), _TRUNCATE);                   // suggested name goes in
+    INT_PTR r = DialogBoxIndirectParamW(g_hInst, (LPCDLGTEMPLATEW)t.data(), owner,
+        NameDlgProc, (LPARAM)&d); // blocks until closed
+    if (r != IDOK) return false;                                  // cancelled
+    name = d.name;                                                // typed name comes out
+    return true;
+}
+
+static std::wstring SuggestName() {            // first unused "Custom N"
+    for (int n = 1; ; ++n) {
+        std::wstring s = L"Custom " + std::to_wstring(n);
+        bool used = false;
+        for (const UserPreset& u : g_user)
+            if (_wcsicmp(u.name.c_str(), s.c_str()) == 0) { used = true; break; }
+        if (!used) return s;
+    }
+}
+
+static int FindPreset(const std::wstring& n) { // index of a preset with this name, or -1
+    for (size_t i = 0; i < g_user.size(); ++i)
+        if (_wcsicmp(g_user[i].name.c_str(), n.c_str()) == 0) return (int)i;
+    return -1;
+}
+
+static std::wstring CleanName(std::wstring s) {
+    for (auto& c : s) if (c == L'[' || c == L']') c = L'-';    // brackets would break the .ini section header
+    size_t a = s.find_first_not_of(L" \t");
+    if (a == std::wstring::npos) return L"";                   // only spaces
+    size_t b = s.find_last_not_of(L" \t");
+    return s.substr(a, b - a + 1);                             // trimmed
+}
+
+static void SaveCurrentAsPreset() {
+    if ((int)g_user.size() >= MAX_USER_PRESETS) {
+        MessageBoxW(g_main, L"Preset limit reached. Delete one first.", L"Cursor Trail", MB_OK);
+        return;
+    }
+
+    std::wstring name = SuggestName();
+    int existing = -1;
+    for (;;) {                                                   // keep asking until we get a usable name
+        if (!AskPresetName(g_main, name)) return;                // Cancel: do nothing
+        name = CleanName(name);
+        if (name.empty()) {
+            MessageBoxW(g_main, L"Please enter a name.", L"Cursor Trail", MB_OK | MB_ICONINFORMATION);
+            name = SuggestName();
+            continue;                                            // ask again
+        }
+        existing = FindPreset(name);
+        if (existing < 0) break;                                 // new name: go ahead
+        int r = MessageBoxW(g_main, L"A preset with that name already exists. Replace it?",
+            L"Cursor Trail", MB_YESNOCANCEL | MB_ICONQUESTION);
+        if (r == IDYES)    break;                                // overwrite it
+        if (r == IDCANCEL) return;                               // give up
+        // IDNO: loop around and ask for a different name
+    }
+
+    UserPreset u;
+    u.name = name;
+    u.mode = g_set.mode;
+    u.count = g_set.count < 2 ? 2 : g_set.count;
+    for (int i = 0; i < MAX_COLORS; ++i) u.colors[i] = g_set.colors[i];
+
+    if (existing >= 0) g_user[existing] = u;                     // replace in place
+    else               g_user.push_back(u);
+
+    SavePresets();
+    RebuildPresetsMenu();
+}
+
 // ------------------------------------------------------------------ menu
 static void BuildMenu() {
     g_menu = CreateMenu();
@@ -964,10 +1262,9 @@ static void BuildMenu() {
     AppendMenuW(color, MF_POPUP, (UINT_PTR)edit, L"&Edit color");
     AppendMenuW(g_menu, MF_POPUP, (UINT_PTR)color, L"&Color");
 
-    HMENU presets = CreatePopupMenu();
-    for (int i = 0; i < COUNT(kPresets); ++i)
-        AppendMenuW(presets, MF_STRING, ID_PRESET_BASE + i, kPresets[i].name);
-    AppendMenuW(g_menu, MF_POPUP, (UINT_PTR)presets, L"&Presets");
+    g_presetsMenu = CreatePopupMenu();
+    AppendMenuW(g_menu, MF_POPUP, (UINT_PTR)g_presetsMenu, L"&Presets");
+    RebuildPresetsMenu();
 
     HMENU width = CreatePopupMenu();
     for (int i = 0; i < COUNT(kWidths); ++i) {
@@ -1114,6 +1411,18 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             for (int i = 0; i < MAX_COLORS; ++i) g_set.colors[i] = p.cols[i];
             if (p.count < 2 && p.mode == MODE_SOLID) g_set.colors[1] = p.cols[0];
         }
+        else if (id == ID_SAVE_PRESET) SaveCurrentAsPreset();
+        else if (id >= ID_USERPRESET_BASE && id < ID_USERPRESET_BASE + (int)g_user.size()) {
+            const UserPreset& u = g_user[id - ID_USERPRESET_BASE];
+            g_set.mode = u.mode;
+            g_set.count = u.count;
+            for (int i = 0; i < MAX_COLORS; ++i) g_set.colors[i] = u.colors[i];
+        }
+        else if (id >= ID_DELPRESET_BASE && id < ID_DELPRESET_BASE + (int)g_user.size()) {
+            g_user.erase(g_user.begin() + (id - ID_DELPRESET_BASE));
+            SavePresets();
+            RebuildPresetsMenu();
+        }
         else if (id >= ID_WIDTH_BASE && id < ID_WIDTH_BASE + COUNT(kWidths))
             g_set.width = kWidths[id - ID_WIDTH_BASE];
         else if (id >= ID_LEN_BASE && id < ID_LEN_BASE + COUNT(kLengths))
@@ -1129,6 +1438,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DESTROY:
         KillTimer(h, TIMER_SAMPLE);
         KillTimer(h, TIMER_RENDER);
+        SaveSettings();             // remember the last setup
         PostQuitMessage(0);
         return 0;
     }
@@ -1163,6 +1473,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nShow) {
     oc.lpszClassName = L"CursorTrailOverlay";
     RegisterClassW(&oc);
 
+    InitIniPath();
+    LoadSettings();
+    LoadPresets();
     BuildMenu();
 
     RECT r = { 0, 0, 460, 126 };

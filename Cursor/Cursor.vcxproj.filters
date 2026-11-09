@@ -15,8 +15,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="cursor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
+    <ClCompile Include="cursor.cpp" />
   </ItemGroup>
 </Project>
